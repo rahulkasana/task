@@ -4,7 +4,7 @@ import { surveys } from '../../db/schema/surveys.ts';
 import { questions } from '../../db/schema/questions.ts';
 import { submissions } from '../../db/schema/submissions.ts';
 import { answers } from '../../db/schema/answers.ts';
-import { eq, asc } from 'drizzle-orm';
+import { eq, asc , and} from 'drizzle-orm';
 
 const app = new Hono();
 
@@ -106,7 +106,7 @@ app.get('/:surveyId/submissions/:submissionId', async (c: Context) => {
   const subs = await db
     .select()
     .from(submissions)
-    .where(eq(submissions.id, submissionId), eq(submissions.userId, userId));
+    .where(and(eq(submissions.id, submissionId), eq(submissions.userId, userId)));
   if (subs.length === 0) {
     return c.json({ error: 'Submission not found' }, 404);
   }
