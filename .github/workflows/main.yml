@@ -1,0 +1,149 @@
+name: deploy-openai-lambda
+
+on:
+  push:
+   branches: ["main", "lambda"]
+   paths:
+     - 'packages/openai/**'
+     - '.github/workflows/deploy-openai-lambda.yaml'
+  pull_request:
+    branches:
+      - 'main'
+    paths:
+      - 'packages/openai/**'
+      - '.github/workflows/deploy-openai-lambda.yaml'
+
+  # Manual deployment with stage selection
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Deployment stage'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - prod
+      deployment_type:
+        description: 'Type of deployment'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+        - auto
+        - full
+        - code-only
+
+concurrency: deploy-openai-lambda-${{ github.event.inputs.stage || 'dev' }}
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infrastructure-changed: ${{ steps.changes.outputs.infrastructure }}
+      code-changed: ${{ steps.changes.outputs.code }}
+      deployment-type: ${{ steps.determine-type.outputs.type }}
+      target-stage: ${{ steps.determine-stage.outputs.stage }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+
+      - name: Determine target stage
+        id: determine-stage
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "stage=${{ github.event.inputs.stage }}" >> $GITHUB_OUTPUT
+          else
+            # Auto-deploy to dev on push
+            echo "stage=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Detect changes
+        id: changes
+        if: github.event_name == 'push'
+        run: |
+          # Check if infrastructure files changed
+          if git diff --name-only HEAD~1 HEAD | grep -E "packages/openai/(serverless\.yml|package\.json|tsconfig\.json)$"; then
+            echo "infrastructure=true" >> $GITHUB_OUTPUT
+          else
+            echo "infrastructure=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check if source code changed
+          if git diff --name-only HEAD~1 HEAD | grep -E "packages/openai/src/"; then
+            echo "code=true" >> $GITHUB_OUTPUT
+          else
+            echo "code=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine deployment type
+        id: determine-type
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "type=${{ github.event.inputs.deployment_type }}" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.changes.outputs.infrastructure }}" == "true" ]; then
+            echo "type=full" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.changes.outputs.code }}" == "true" ]; then
+            echo "type=code-only" >> $GITHUB_OUTPUT
+          else
+            echo "type=none" >> $GITHUB_OUTPUT
+          fi
+
+  deploy:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.deployment-type != 'none'
+    runs-on: ubuntu-latest
+    # Use environment based on target stage
+    environment: ${{ needs.detect-changes.outputs.target-stage == 'prod' && 'production' || 'development' }}
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js 18 with npm cache
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-1
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./packages/openai
+
+      - name: TypeScript build and validation
+        run: npm run build
+        working-directory: ./packages/openai
+
+      - name: Full deployment (Infrastructure + Code)
+        if: needs.detect-changes.outputs.deployment-type == 'full' || needs.detect-changes.outputs.deployment-type == 'auto'
+        run: |
+          STAGE=${{ needs.detect-changes.outputs.target-stage }}
+          echo "🏗️ Full deployment to $STAGE (infrastructure + code)"
+          npm run deploy:$STAGE
+        working-directory: ./packages/openai
+
+      - name: Code-only deployment
+        if: needs.detect-changes.outputs.deployment-type == 'code-only'
+        run: |
+          STAGE=${{ needs.detect-changes.outputs.target-stage }}
+          echo "⚡ Code-only deployment to $STAGE (faster)"
+          npx serverless deploy function --function processor --stage $STAGE
+        working-directory: ./packages/openai
+
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 OpenAI Lambda Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type**: ${{ needs.detect-changes.outputs.deployment-type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Stage**: ${{ needs.detect-changes.outputs.target-stage }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Infrastructure Changed**: ${{ needs.detect-changes.outputs.infrastructure-changed }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Code Changed**: ${{ needs.detect-changes.outputs.code-changed }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
